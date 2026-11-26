@@ -1,9 +1,20 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+
+# Virtual environments & secrets
 .env
 .venv/
 venv/
+
+# Local SQLite & generated scan outputs
 SRC/artifacts/*.db
 SRC/artifacts/*.db-wal
 SRC/artifacts/*.db-shm
 SRC/artifacts/outputs/
+
+# Training runs & OS files
+runs/
+.DS_Store
+Thumbs.db
