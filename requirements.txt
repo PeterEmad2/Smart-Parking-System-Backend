@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-multipart
+ultralytics
+opencv-python-headless
+numpy
+pillow
+arabic-reshaper
+python-bidi
+python-dotenv
+pydantic
