@@ -3,9 +3,10 @@ import os
 from contextlib import asynccontextmanager
 from typing import Literal
 
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import Body, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
+from pydantic import BaseModel, Field
 
 from SRC.utils.config import (
     APP_NAME,
@@ -17,16 +18,44 @@ from SRC.utils.config import (
     get_device,
     is_model_loaded,
 )
-from SRC.utils.db import delete_scan, get_scan, init_db, list_scans, save_scan
+from SRC.utils.db import (
+    checkout_parking_session,
+    delete_parking_session,
+    delete_scan,
+    get_parking_rates,
+    get_scan,
+    init_db,
+    list_parking_sessions,
+    list_scans,
+    process_parking_for_scan,
+    save_scan,
+    update_parking_rates,
+)
 from SRC.utils.inference import run_pipeline
-from SRC.utils.response import DeleteResponse, HealthResponse, HistoryResponse, ScanResponse, VehicleType
+from SRC.utils.response import (
+    DeleteResponse,
+    DeleteSessionResponse,
+    GateMode,
+    HealthResponse,
+    HistoryResponse,
+    ParkingRates,
+    ParkingSessionRecord,
+    ParkingSessionsResponse,
+    ScanResponse,
+    VehicleType,
+)
 
 logger = logging.getLogger(__name__)
 
 
+class UpdateRatesPayload(BaseModel):
+    car_rate_egp: float = Field(gt=0.0, le=5000.0)
+    motorcycle_rate_egp: float = Field(gt=0.0, le=5000.0)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Initialize SQLite storage on startup."""
+    """Initialize SQLite storage and Smart Parking tables on startup."""
     init_db()
     yield
 
@@ -48,7 +77,7 @@ app.add_middleware(
 
 
 def _to_scan_response(scan: dict, request: Request) -> ScanResponse:
-    """Map a database scan dict into a public ScanResponse with its image URL."""
+    """Map a database scan dict into a public ScanResponse with its image URL and parking events."""
     image_url = (
         str(request.url_for("get_scan_image", scan_id=scan["scan_id"]))
         if scan.get("has_annotated_image")
@@ -61,6 +90,7 @@ def _to_scan_response(scan: dict, request: Request) -> ScanResponse:
         plates=scan["plates"],
         annotated_image_url=image_url,
         created_at=scan["created_at"],
+        parking_events=scan.get("parking_events", []),
     )
 
 
@@ -87,7 +117,7 @@ def health():
         },
         201: {
             "model": ScanResponse,
-            "description": "Scan metadata and annotated_image_url when format=json",
+            "description": "Scan metadata, annotated_image_url, and smart parking entry/exit events",
         },
     },
 )
@@ -97,8 +127,12 @@ async def analyze(
     format: Literal["json", "image"] = Query("json"),
     plate_conf: float = Query(PLATE_CONF, ge=0.0, le=1.0),
     char_conf: float = Query(CHAR_CONF, ge=0.0, le=1.0),
+    gate_mode: GateMode = Query("auto"),
+    simulate_minutes: int = Query(0, ge=0, le=10080),
+    car_rate_egp: float | None = Query(None, gt=0.0, le=5000.0),
+    motorcycle_rate_egp: float | None = Query(None, gt=0.0, le=5000.0),
 ):
-    """Run plate detection + RTL Arabic OCR, persist scan, and return JSON URL or JPEG bytes."""
+    """Run plate detection + RTL Arabic OCR, match smart parking Entry/Exit, and persist records."""
     try:
         image_bytes = await file.read()
         if not image_bytes:
@@ -111,6 +145,15 @@ async def analyze(
 
         result = run_pipeline(image_bytes, plate_conf=plate_conf, char_conf=char_conf)
         saved = save_scan(file.filename, result["plates"], result["annotated_image"])
+        parking_events = process_parking_for_scan(
+            scan_id=saved["scan_id"],
+            plates=result["plates"],
+            scan_time_iso=saved["created_at"],
+            gate_mode=gate_mode,
+            simulate_minutes=simulate_minutes,
+            car_rate_override=car_rate_egp,
+            moto_rate_override=motorcycle_rate_egp,
+        )
         image_url = str(request.url_for("get_scan_image", scan_id=saved["scan_id"]))
 
         if format == "image":
@@ -131,6 +174,7 @@ async def analyze(
             plates=result["plates"],
             annotated_image_url=image_url,
             created_at=saved["created_at"],
+            parking_events=parking_events,
         )
         return JSONResponse(content=payload.model_dump(), status_code=201)
     except HTTPException:
@@ -143,6 +187,68 @@ async def analyze(
             status_code=500,
             detail="Internal server error during image analysis",
         )
+
+
+@app.get("/parking/rates", response_model=ParkingRates)
+def read_parking_rates():
+    """Fetch current EGP hourly parking rates."""
+    return ParkingRates(**get_parking_rates())
+
+
+@app.put("/parking/rates", response_model=ParkingRates)
+def write_parking_rates(payload: UpdateRatesPayload = Body(...)):
+    """Update EGP hourly parking rates for cars and motorcycles."""
+    updated = update_parking_rates(
+        car_rate_egp=payload.car_rate_egp,
+        motorcycle_rate_egp=payload.motorcycle_rate_egp,
+    )
+    return ParkingRates(**updated)
+
+
+@app.get("/parking/sessions", response_model=ParkingSessionsResponse)
+def get_parking_ledger(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    status: Literal["all", "parked", "completed"] = Query("all"),
+    plate: str | None = Query(None),
+    vehicle_type: VehicleType | None = Query(None),
+):
+    """List smart parking sessions (active parked & completed exits) plus revenue KPIs."""
+    status_filter = None if status == "all" else status
+    total, sessions, summary = list_parking_sessions(
+        limit=limit,
+        offset=offset,
+        status=status_filter,
+        plate_query=plate,
+        vehicle_type=vehicle_type,
+    )
+    return ParkingSessionsResponse(
+        total=total,
+        limit=limit,
+        offset=offset,
+        summary=summary,
+        sessions=sessions,
+    )
+
+
+@app.post("/parking/sessions/{session_id}/checkout", response_model=ParkingSessionRecord)
+def manual_session_checkout(
+    session_id: int,
+    simulate_minutes: int = Query(0, ge=0, le=10080),
+):
+    """Check out an active parked vehicle and calculate final duration & EGP fee."""
+    checked_out = checkout_parking_session(session_id, simulate_minutes=simulate_minutes)
+    if checked_out is None:
+        raise HTTPException(status_code=404, detail=f"Parking session {session_id} not found")
+    return ParkingSessionRecord(**checked_out)
+
+
+@app.delete("/parking/sessions/{session_id}", response_model=DeleteSessionResponse)
+def remove_parking_session(session_id: int):
+    """Delete a parking session record."""
+    if not delete_parking_session(session_id):
+        raise HTTPException(status_code=404, detail=f"Parking session {session_id} not found")
+    return DeleteSessionResponse(deleted_session_id=session_id)
 
 
 @app.get("/scans", response_model=HistoryResponse)
@@ -183,7 +289,9 @@ def get_scan_image(scan_id: int):
 
     image_path = scan.get("annotated_image_path")
     if not image_path or not os.path.isfile(image_path):
-        raise HTTPException(status_code=404, detail=f"Annotated image for scan {scan_id} not found")
+        raise HTTPException(
+            status_code=404, detail=f"Annotated image for scan {scan_id} not found"
+        )
 
     return FileResponse(
         path=image_path,
