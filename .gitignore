@@ -14,6 +14,9 @@ SRC/artifacts/*.db-wal
 SRC/artifacts/*.db-shm
 SRC/artifacts/outputs/
 
+# PyTorch training checkpoints (production uses lightweight .onnx weights)
+SRC/artifacts/*.pt
+
 # Training runs & OS files
 runs/
 .DS_Store
